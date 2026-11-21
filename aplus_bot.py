@@ -1,0 +1,245 @@
+"""
+A+ Trade Checklist -> Discord alert bot
+Symbols: SPX, SPY, SOXS, TSLA
+
+Setup:
+    pip install yfinance pandas requests
+    export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/...."
+    python aplus_bot.py          # run the bot
+    python aplus_bot.py --test   # send a test message to Discord
+
+Notes:
+- Uses Yahoo Finance data (free, can be ~15 min delayed for some tickers).
+  For real-time, swap fetch() for Polygon / Alpaca / Tradier / IBKR.
+- Checks 1-8 are automated. Item 9 (stop/target/max loss) is YOUR job:
+  the alert suggests a stop/target, but you must confirm your own.
+- Alerts only. It never places trades. Not financial advice.
+"""
+import os
+import sys
+import time
+import datetime as dt
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+import requests
+import yfinance as yf
+
+# ----------------------------- CONFIG ---------------------------------
+WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "PASTE_WEBHOOK_URL_HERE")
+
+SYMBOLS = {"SPX": "^GSPC", "SPY": "SPY", "SOXS": "SOXS", "TSLA": "TSLA"}
+VOLUME_PROXY = {"SPX": "SPY"}   # index has no volume -> use SPY's
+OPTION_PROXY = {"SPX": "SPY"}   # SPX chain unreliable on Yahoo -> use SPY's
+
+PULLBACK_LOOKBACK = 6      # closed 5m bars to look back for a pullback touch
+PULLBACK_ATR_TOL = 0.25    # "at the level" = within 0.25 x ATR
+VOLUME_MULT = 1.0          # last bar vol >= this x 20-bar average
+MAX_SPREAD_PCT = 10.0      # option bid/ask spread as % of mid
+RR_TARGET = 2.0            # suggested target = 2R
+COOLDOWN_MIN = 30          # min minutes between alerts per symbol+side
+POLL_SECONDS = 30
+ET = ZoneInfo("America/New_York")
+# -----------------------------------------------------------------------
+
+LABELS = [
+    "15-min trend agrees",
+    "5-min chart confirms direction",
+    "Correct side of VWAP",
+    "9 EMA & 21 EMA agree",
+    "Pulled back to meaningful level",
+    "Confirmation candle CLOSED",
+    "Volume supports the move",
+    "Option bid/ask spread OK",
+]
+
+
+def fetch(ticker, interval, period):
+    df = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=False)
+    if df.empty:
+        return df
+    df.index = df.index.tz_convert(ET)
+    minutes = int(interval.replace("m", ""))
+    now = dt.datetime.now(ET)
+    # keep only fully CLOSED bars
+    return df[df.index + pd.Timedelta(minutes=minutes) <= now]
+
+
+def ema(s, n):
+    return s.ewm(span=n, adjust=False).mean()
+
+
+def atr(df, n=14):
+    pc = df["Close"].shift()
+    tr = pd.concat([df["High"] - df["Low"], (df["High"] - pc).abs(), (df["Low"] - pc).abs()], axis=1).max(axis=1)
+    return tr.rolling(n).mean()
+
+
+def session_vwap(df, vol):
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3
+    day = df.index.date
+    pv = (tp * vol).groupby(day).cumsum()
+    v = vol.groupby(day).cumsum()
+    return pv / v
+
+
+def option_spread_ok(sym, side):
+    """Nearest-expiry ATM option spread check. Returns (ok, text)."""
+    try:
+        t = yf.Ticker(OPTION_PROXY.get(sym, SYMBOLS[sym]))
+        price = t.fast_info["last_price"]
+        chain = t.option_chain(t.options[0])
+        opts = chain.calls if side == 1 else chain.puts
+        row = opts.iloc[(opts["strike"] - price).abs().argsort()[:1]].iloc[0]
+        bid, ask = float(row["bid"]), float(row["ask"])
+        if ask <= 0 or bid <= 0:
+            return False, "no live bid/ask"
+        pct = (ask - bid) / ((ask + bid) / 2) * 100
+        tag = f"{row['strike']:.0f}{'C' if side == 1 else 'P'} {bid:.2f}x{ask:.2f} ({pct:.1f}%)"
+        return pct <= MAX_SPREAD_PCT, tag
+    except Exception as e:
+        return False, f"error: {e}"
+
+
+def evaluate(sym, side):
+    """side = +1 (calls / long) or -1 (puts / short). Returns dict or None."""
+    tk = SYMBOLS[sym]
+    d5 = fetch(tk, "5m", "5d")
+    d15 = fetch(tk, "15m", "10d")
+    if len(d5) < 40 or len(d15) < 30:
+        return None
+
+    vol = d5["Volume"]
+    if vol.sum() == 0 and sym in VOLUME_PROXY:
+        pv = fetch(VOLUME_PROXY[sym], "5m", "5d")["Volume"]
+        vol = pv.reindex(d5.index).fillna(0)
+
+    c5 = d5["Close"]
+    e9, e21 = ema(c5, 9), ema(c5, 21)
+    vwap = session_vwap(d5, vol)
+    a = atr(d5).iloc[-1]
+    last = d5.iloc[-1]
+    prev = d5.iloc[-2]
+
+    # 1. 15-min trend
+    c15 = d15["Close"]
+    t9, t21 = ema(c15, 9).iloc[-1], ema(c15, 21).iloc[-1]
+    chk = [side * (t9 - t21) > 0 and side * (c15.iloc[-1] - t21) > 0]
+
+    # 2. 5-min confirms direction (close past 9 EMA, 9 EMA sloping with trade)
+    chk.append(side * (last["Close"] - e9.iloc[-1]) > 0 and side * (e9.iloc[-1] - e9.iloc[-4]) > 0)
+
+    # 3. VWAP side
+    chk.append(side * (last["Close"] - vwap.iloc[-1]) > 0)
+
+    # 4. EMAs agree
+    chk.append(side * (e9.iloc[-1] - e21.iloc[-1]) > 0)
+
+    # 5. Pullback to a meaningful level (21 EMA, VWAP, prior-day high/low, today's open)
+    today = d5.index[-1].date()
+    prior = d5[d5.index.date < today]
+    todays = d5[d5.index.date == today]
+    pd_hi = prior["High"].iloc[prior.index.date == prior.index.date[-1]].max() if len(prior) else None
+    pd_lo = prior["Low"].iloc[prior.index.date == prior.index.date[-1]].min() if len(prior) else None
+    tol = PULLBACK_ATR_TOL * a
+    window = d5.iloc[-(PULLBACK_LOOKBACK + 1):-1]
+    pull_extreme = None
+    hit = False
+    for i in range(len(window)):
+        bar = window.iloc[i]
+        ts = window.index[i]
+        levels = [e21.loc[ts], vwap.loc[ts], todays["Open"].iloc[0] if len(todays) else None, pd_hi, pd_lo]
+        probe = bar["Low"] if side == 1 else bar["High"]
+        if any(l is not None and pd.notna(l) and abs(probe - l) <= tol for l in levels):
+            hit = True
+            pull_extreme = probe if pull_extreme is None else (min(pull_extreme, probe) if side == 1 else max(pull_extreme, probe))
+    chk.append(hit)
+
+    # 6. Confirmation candle CLOSED (we only use closed bars) in trade direction
+    if side == 1:
+        conf = last["Close"] > last["Open"] and last["Close"] > prev["High"]
+    else:
+        conf = last["Close"] < last["Open"] and last["Close"] < prev["Low"]
+    chk.append(bool(conf))
+
+    # 7. Volume
+    avg = vol.iloc[-21:-1].mean()
+    chk.append(avg > 0 and vol.iloc[-1] >= VOLUME_MULT * avg)
+
+    # 8. Option spread (only hit the options API if the chart checks pass)
+    spread_txt = "skipped"
+    if all(chk):
+        ok, spread_txt = option_spread_ok(sym, side)
+        chk.append(ok)
+    else:
+        chk.append(False)
+
+    entry = float(last["Close"])
+    if pull_extreme is None:
+        pull_extreme = float(last["Low"] if side == 1 else last["High"])
+    stop = pull_extreme - 0.1 * a if side == 1 else pull_extreme + 0.1 * a
+    target = entry + side * RR_TARGET * abs(entry - stop)
+
+    return dict(sym=sym, side=side, checks=[bool(x) for x in chk], entry=entry,
+                stop=float(stop), target=float(target), spread=spread_txt,
+                bar=d5.index[-1])
+
+
+def send_discord(r):
+    direction = "CALLS (long)" if r["side"] == 1 else "PUTS (short)"
+    lines = [f"{'✅' if ok else '❌'} {lab}" for ok, lab in zip(r["checks"], LABELS)]
+    lines.append("⬜ **#9 YOUR job:** confirm stop, target & max loss")
+    desc = "\n".join(lines)
+    desc += (f"\n\n**Spread:** {r['spread']}"
+             f"\n**Underlying entry ~** {r['entry']:.2f}"
+             f"\n**Suggested stop:** {r['stop']:.2f}"
+             f"\n**Suggested {RR_TARGET:.0f}R target:** {r['target']:.2f}")
+    payload = {"embeds": [{
+        "title": f"🚨 A+ SETUP: {r['sym']} — {direction}",
+        "description": desc,
+        "color": 0x2ECC71 if r["side"] == 1 else 0xE74C3C,
+        "footer": {"text": f"5m bar closed {r['bar'].strftime('%H:%M ET')} • alert only, not advice"},
+    }]}
+    requests.post(WEBHOOK_URL, json=payload, timeout=10)
+
+
+def market_open():
+    n = dt.datetime.now(ET)
+    if n.weekday() >= 5:
+        return False
+    return dt.time(9, 35) <= n.time() <= dt.time(15, 45)
+
+
+def main():
+    if "--test" in sys.argv:
+        requests.post(WEBHOOK_URL, json={"content": "✅ A+ checklist bot connected."}, timeout=10)
+        print("Test message sent.")
+        return
+
+    last_bar, last_alert = {}, {}
+    print("Bot running. Ctrl+C to stop.")
+    while True:
+        try:
+            if market_open():
+                for sym in SYMBOLS:
+                    for side in (1, -1):
+                        r = evaluate(sym, side)
+                        if r is None:
+                            continue
+                        key = (sym, side)
+                        if last_bar.get(key) == r["bar"]:
+                            continue  # already evaluated this 5m bar
+                        last_bar[key] = r["bar"]
+                        if all(r["checks"]):
+                            since = time.time() - last_alert.get(key, 0)
+                            if since > COOLDOWN_MIN * 60:
+                                send_discord(r)
+                                last_alert[key] = time.time()
+                                print(f"Alert sent: {sym} {'long' if side == 1 else 'short'}")
+        except Exception as e:
+            print("Error:", e)
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
