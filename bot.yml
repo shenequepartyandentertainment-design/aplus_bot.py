@@ -1,0 +1,23 @@
+name: A+ Trade Bot
+
+on:
+  schedule:
+    # Every 5 min, Mon-Fri, 13:00-20:59 UTC (covers US market hours).
+    # The script itself skips anything outside 9:35-15:45 ET.
+    - cron: "*/5 13-20 * * 1-5"
+  workflow_dispatch:   # lets you run it manually to test
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python aplus_bot.py --once
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
